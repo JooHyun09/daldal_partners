@@ -1,12 +1,15 @@
 /**
  * 달달 파트너스 — 자산관리 대시보드 Worker
- * - /api/portfolio : 전체 포트폴리오 (holdings × 실시간시세)
- * - /api/holdings  : 보유종목 CRUD
- * - /              : 대시보드 HTML
+ * - /api/portfolio  : 전체 포트폴리오 (holdings × 실시간시세)
+ * - /api/holdings   : 보유종목 CRUD
+ * - /api/analysis   : 헤르메스 종목분석 결과 저장 (POST)
+ * - /r/:id          : 종목분석 결과 페이지 (GET)
+ * - /               : 대시보드 HTML
  */
 import { getFinnhubPrice, getUsdKrwRate } from "./finnhub";
 import { getKisStockPrice, getKisToken } from "./kis";
 import { renderDashboard } from "./dashboard";
+import { renderResultPage } from "./render";
 
 export interface Env {
   DB: D1Database;
@@ -186,6 +189,36 @@ export default {
     if (url.pathname === "/api/snapshot" && request.method === "POST") {
       const result = await takeSnapshot(env);
       return Response.json({ success: true, ...result }, { headers: cors });
+    }
+
+    // ── POST /api/analysis (헤르메스 분석 결과 저장) ────
+    if (url.pathname === "/api/analysis" && request.method === "POST") {
+      const data = await request.json<any>();
+      if (!data.ticker || !data.name) {
+        return Response.json({ error: "ticker, name은 필수입니다." }, { status: 400, headers: cors });
+      }
+      const id = crypto.randomUUID().slice(0, 8);
+      const createdAt = new Date().toISOString();
+      await env.DB.prepare(
+        `CREATE TABLE IF NOT EXISTS analysis_results (id TEXT PRIMARY KEY, ticker TEXT, name TEXT, data TEXT, created_at TEXT)`
+      ).run();
+      await env.DB.prepare(
+        `INSERT INTO analysis_results (id, ticker, name, data, created_at) VALUES (?,?,?,?,?)`
+      ).bind(id, data.ticker, data.name, JSON.stringify(data), createdAt).run();
+      const resultUrl = `${url.origin}/r/${id}`;
+      return Response.json({ id, url: resultUrl }, { status: 201, headers: cors });
+    }
+
+    // ── GET /r/:id (종목분석 결과 페이지) ───────────────
+    const rMatch = url.pathname.match(/^\/r\/([a-zA-Z0-9]+)$/);
+    if (rMatch) {
+      const id = rMatch[1];
+      const row = await env.DB.prepare(
+        `SELECT data FROM analysis_results WHERE id = ?`
+      ).bind(id).first<{ data: string }>();
+      if (!row) return new Response("분석 결과를 찾을 수 없습니다.", { status: 404 });
+      const html = renderResultPage(JSON.parse(row.data));
+      return new Response(html, { headers: { "Content-Type": "text/html; charset=utf-8" } });
     }
 
     // ── GET / (대시보드) ──────────────────────────────
