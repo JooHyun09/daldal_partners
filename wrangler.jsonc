@@ -11,5 +11,8 @@
 			"database_name": "daldal-partners-db",
 			"database_id": "e0d21538-9477-4af1-898f-bc115edb1ae0"
 		}
-	]
+	],
+	"triggers": {
+		"crons": ["0 0 * * *"]
+	}
 }

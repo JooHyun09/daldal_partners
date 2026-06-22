@@ -7,34 +7,44 @@ interface KisToken {
 }
 
 let cachedToken: KisToken | null = null;
+let tokenPromise: Promise<string | null> | null = null;
 
 const KIS_BASE = "https://openapi.koreainvestment.com:9443";
 
-// ── 접근토큰 발급 (캐싱: 토큰 유효기간 약 24시간) ──────────
+// ── 접근토큰 발급 (캐싱 + 동시요청 시 단일 in-flight promise 공유) ──
 export async function getKisToken(appKey: string, appSecret: string): Promise<string | null> {
   if (cachedToken && cachedToken.expires_at > Date.now()) {
     return cachedToken.access_token;
   }
-  try {
-    const res = await fetch(`${KIS_BASE}/oauth2/tokenP`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        grant_type: "client_credentials",
-        appkey: appKey,
-        appsecret: appSecret,
-      }),
-    });
-    if (!res.ok) return null;
-    const data = await res.json<{ access_token: string; expires_in: number }>();
-    cachedToken = {
-      access_token: data.access_token,
-      expires_at: Date.now() + (data.expires_in - 300) * 1000, // 5분 여유
-    };
-    return data.access_token;
-  } catch {
-    return null;
-  }
+  // 이미 발급 중인 요청이 있으면 그 결과를 기다린다 (동시 다중발급 방지)
+  if (tokenPromise) return tokenPromise;
+
+  tokenPromise = (async () => {
+    try {
+      const res = await fetch(`${KIS_BASE}/oauth2/tokenP`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          grant_type: "client_credentials",
+          appkey: appKey,
+          appsecret: appSecret,
+        }),
+      });
+      if (!res.ok) return null;
+      const data = await res.json<{ access_token: string; expires_in: number }>();
+      cachedToken = {
+        access_token: data.access_token,
+        expires_at: Date.now() + (data.expires_in - 300) * 1000,
+      };
+      return data.access_token;
+    } catch {
+      return null;
+    } finally {
+      tokenPromise = null;
+    }
+  })();
+
+  return tokenPromise;
 }
 
 // ── 국내주식 현재가 조회 ──────────────────────────────
