@@ -1,21 +1,22 @@
 /**
  * 달달 파트너스 — 자산관리 대시보드 Worker
- * - /api/portfolio  : 전체 포트폴리오 (holdings × 실시간시세)
- * - /api/holdings   : 보유종목 CRUD
- * - /api/analysis   : 헤르메스 종목분석 결과 저장 (POST)
- * - /r/:id          : 종목분석 결과 페이지 (GET)
- * - /               : 대시보드 HTML
+ * - /api/portfolio        : 전체 포트폴리오 (holdings × 실시간시세)
+ * - /api/holdings         : 보유종목 CRUD
+ * - /api/content-checks   : 콘텐츠 검증 결과 저장/조회
+ * - /                     : 대시보드 HTML
  */
 import { getFinnhubPrice, getUsdKrwRate } from "./finnhub";
 import { getKisStockPrice, getKisToken } from "./kis";
 import { renderDashboard } from "./dashboard";
-import { renderResultPage } from "./render";
 
 export interface Env {
   DB: D1Database;
   FINNHUB_API_KEY: string;
   KIS_APP_KEY: string;
   KIS_APP_SECRET: string;
+  GEMINI_KEY_1: string;
+  GEMINI_KEY_2: string;
+  GEMINI_KEY_3: string;
 }
 
 interface Holding {
@@ -32,10 +33,25 @@ interface Holding {
   cash_value_krw: number;
 }
 
+interface ContentCheckBody {
+  input_text: string;
+  channel_name?: string;
+  channel_grade?: string;
+  channel_stars?: number;
+  content_type?: string;
+  checklist_pass?: number;
+  checklist_total?: number;
+  summary?: string;
+  portfolio_points?: string;
+  verdict?: string;
+  verdict_reason?: string;
+  raw_result?: string;
+}
+
 // 평가금액 계산 (시세 × 수량, 원화 환산)
 function calcValue(h: Holding, price: number | null, fxRate: number): number {
   if (h.is_cash) return h.cash_value_krw;
-  if (price === null) return h.avg_price * h.quantity; // 시세 실패 시 매입가 기준
+  if (price === null) return h.avg_price * h.quantity;
   const value = price * h.quantity;
   return h.currency === "USD" ? value * fxRate : value;
 }
@@ -46,7 +62,7 @@ function calcCost(h: Holding, fxRate: number): number {
   return h.currency === "USD" ? cost * fxRate : cost;
 }
 
-// 포트폴리오 전체 계산 (모든 holdings + 실시간 시세)
+// 포트폴리오 전체 계산
 async function buildPortfolio(env: Env) {
   const { results } = await env.DB.prepare(
     "SELECT * FROM holdings ORDER BY account, name"
@@ -54,7 +70,6 @@ async function buildPortfolio(env: Env) {
 
   const fxRate = await getUsdKrwRate(env.FINNHUB_API_KEY);
 
-  // KR 종목이 있으면 토큰을 먼저 한 번만 발급받아 캐시 (동시요청 race condition 방지)
   const hasKr = results.some((h) => h.market === "KR" && !h.is_cash && h.ticker);
   if (hasKr) {
     await getKisToken(env.KIS_APP_KEY, env.KIS_APP_SECRET);
@@ -81,7 +96,7 @@ async function buildPortfolio(env: Env) {
   return { items, fxRate, generatedAt: new Date().toISOString() };
 }
 
-// 오늘 날짜 기준 스냅샷 저장 (Cron이 매일 호출, 수동 트리거도 가능)
+// 스냅샷 저장
 async function takeSnapshot(env: Env): Promise<{ date: string; net_worth_krw: number }> {
   const portfolio = await buildPortfolio(env);
   const finValue = portfolio.items.reduce((s, i) => s + i.value_krw, 0);
@@ -91,7 +106,7 @@ async function takeSnapshot(env: Env): Promise<{ date: string; net_worth_krw: nu
   const fixedTotal = fixed.reduce((s, f) => s + f.value_krw, 0);
   const netWorth = finValue + fixedTotal;
 
-  const date = new Date().toISOString().slice(0, 10); // YYYY-MM-DD (UTC 기준)
+  const date = new Date().toISOString().slice(0, 10);
 
   await env.DB.prepare(
     `INSERT INTO daily_snapshot (date, fin_value_krw, fin_cost_krw, net_worth_krw, fx_rate)
@@ -127,7 +142,7 @@ export default {
       return Response.json(portfolio, { headers: cors });
     }
 
-    // ── GET /api/holdings (raw list, 시세 없이) ─────
+    // ── GET /api/holdings ───────────────────────────
     if (url.pathname === "/api/holdings" && request.method === "GET") {
       const { results } = await env.DB.prepare(
         "SELECT * FROM holdings ORDER BY account, name"
@@ -135,7 +150,7 @@ export default {
       return Response.json(results, { headers: cors });
     }
 
-    // ── POST /api/holdings (신규 종목 추가) ──────────
+    // ── POST /api/holdings ──────────────────────────
     if (url.pathname === "/api/holdings" && request.method === "POST") {
       const body = await request.json<Partial<Holding>>();
       const result = await env.DB.prepare(
@@ -151,7 +166,7 @@ export default {
       return Response.json({ success: true, id: result.meta.last_row_id }, { headers: cors });
     }
 
-    // ── PUT /api/holdings/:id (수정) ────────────────
+    // ── PUT /api/holdings/:id ───────────────────────
     const putMatch = url.pathname.match(/^\/api\/holdings\/(\d+)$/);
     if (putMatch && request.method === "PUT") {
       const id = putMatch[1];
@@ -164,20 +179,20 @@ export default {
       return Response.json({ success: true }, { headers: cors });
     }
 
-    // ── DELETE /api/holdings/:id ─────────────────────
+    // ── DELETE /api/holdings/:id ────────────────────
     const delMatch = url.pathname.match(/^\/api\/holdings\/(\d+)$/);
     if (delMatch && request.method === "DELETE") {
       await env.DB.prepare("DELETE FROM holdings WHERE id=?").bind(delMatch[1]).run();
       return Response.json({ success: true }, { headers: cors });
     }
 
-    // ── GET /api/fixed-assets (부동산/대출) ──────────
+    // ── GET /api/fixed-assets ───────────────────────
     if (url.pathname === "/api/fixed-assets" && request.method === "GET") {
       const { results } = await env.DB.prepare("SELECT * FROM fixed_assets").all();
       return Response.json(results, { headers: cors });
     }
 
-    // ── GET /api/snapshots (추이 그래프용 일별 데이터) ──
+    // ── GET /api/snapshots ──────────────────────────
     if (url.pathname === "/api/snapshots" && request.method === "GET") {
       const { results } = await env.DB.prepare(
         "SELECT * FROM daily_snapshot ORDER BY date ASC"
@@ -185,45 +200,68 @@ export default {
       return Response.json(results, { headers: cors });
     }
 
-    // ── POST /api/snapshot (수동 스냅샷 트리거, 테스트용) ──
+    // ── POST /api/snapshot ──────────────────────────
     if (url.pathname === "/api/snapshot" && request.method === "POST") {
       const result = await takeSnapshot(env);
       return Response.json({ success: true, ...result }, { headers: cors });
     }
 
-    // ── POST /api/analysis (헤르메스 분석 결과 저장) ────
-    if (url.pathname === "/api/analysis" && request.method === "POST") {
-      const data = await request.json<any>();
-      if (!data.ticker || !data.name) {
-        return Response.json({ error: "ticker, name은 필수입니다." }, { status: 400, headers: cors });
-      }
-      const id = crypto.randomUUID().slice(0, 8);
-      const createdAt = new Date().toISOString();
-      await env.DB.prepare(
-        `CREATE TABLE IF NOT EXISTS analysis_results (id TEXT PRIMARY KEY, ticker TEXT, name TEXT, data TEXT, created_at TEXT)`
-      ).run();
-      await env.DB.prepare(
-        `INSERT INTO analysis_results (id, ticker, name, data, created_at) VALUES (?,?,?,?,?)`
-      ).bind(id, data.ticker, data.name, JSON.stringify(data), createdAt).run();
-      const resultUrl = `${url.origin}/r/${id}`;
-      return Response.json({ id, url: resultUrl }, { status: 201, headers: cors });
+    // ── GET /api/content-checks ─────────────────────
+    if (url.pathname === "/api/content-checks" && request.method === "GET") {
+      const { results } = await env.DB.prepare(
+        "SELECT * FROM content_checks ORDER BY created_at DESC LIMIT 100"
+      ).all();
+      return Response.json(results, { headers: cors });
     }
 
-    // ── GET /r/:id (종목분석 결과 페이지) ───────────────
-    const rMatch = url.pathname.match(/^\/r\/([a-zA-Z0-9]+)$/);
-    if (rMatch) {
-      const id = rMatch[1];
-      const row = await env.DB.prepare(
-        `SELECT data FROM analysis_results WHERE id = ?`
-      ).bind(id).first<{ data: string }>();
-      if (!row) return new Response("분석 결과를 찾을 수 없습니다.", { status: 404 });
-      const html = renderResultPage(JSON.parse(row.data));
-      return new Response(html, { headers: { "Content-Type": "text/html; charset=utf-8" } });
+    // ── POST /api/content-checks (검증 결과 저장) ───
+    if (url.pathname === "/api/content-checks" && request.method === "POST") {
+      const body = await request.json<ContentCheckBody>();
+      const result = await env.DB.prepare(
+        `INSERT INTO content_checks
+          (input_text, channel_name, channel_grade, channel_stars, content_type,
+           checklist_pass, checklist_total, summary, portfolio_points,
+           verdict, verdict_reason, raw_result)
+         VALUES (?,?,?,?,?,?,?,?,?,?,?,?)`
+      )
+        .bind(
+          body.input_text,
+          body.channel_name ?? null,
+          body.channel_grade ?? null,
+          body.channel_stars ?? 0,
+          body.content_type ?? null,
+          body.checklist_pass ?? 0,
+          body.checklist_total ?? 5,
+          body.summary ?? null,
+          body.portfolio_points ?? null,
+          body.verdict ?? null,
+          body.verdict_reason ?? null,
+          body.raw_result ?? null
+        )
+        .run();
+      return Response.json({ success: true, id: result.meta.last_row_id }, { headers: cors });
     }
 
-    // ── GET / (대시보드) ──────────────────────────────
+    // ── DELETE /api/content-checks/:id ─────────────
+    const ccDelMatch = url.pathname.match(/^\/api\/content-checks\/(\d+)$/);
+    if (ccDelMatch && request.method === "DELETE") {
+      await env.DB.prepare("DELETE FROM content_checks WHERE id=?").bind(ccDelMatch[1]).run();
+      return Response.json({ success: true }, { headers: cors });
+    }
+
+    // ── PATCH /api/content-checks/:id/apply ─────────
+    // 검증 결과를 포트폴리오에 반영했음을 기록
+    const ccApplyMatch = url.pathname.match(/^\/api\/content-checks\/(\d+)\/apply$/);
+    if (ccApplyMatch && request.method === "PATCH") {
+      await env.DB.prepare(
+        "UPDATE content_checks SET applied_to_portfolio=1 WHERE id=?"
+      ).bind(ccApplyMatch[1]).run();
+      return Response.json({ success: true }, { headers: cors });
+    }
+
+    // ── GET / (대시보드) ────────────────────────────
     if (url.pathname === "/" || url.pathname === "/dashboard") {
-      const html = renderDashboard();
+      const html = renderDashboard([env.GEMINI_KEY_1, env.GEMINI_KEY_2, env.GEMINI_KEY_3]);
       return new Response(html, {
         headers: { "Content-Type": "text/html; charset=utf-8" },
       });
@@ -232,9 +270,7 @@ export default {
     return new Response("Not Found", { status: 404, headers: cors });
   },
 
-  // ── Cron Trigger: 매일 UTC 0시(한국시간 09:00) 스냅샷 저장 ──
   async scheduled(event, env, ctx): Promise<void> {
-    const result = await takeSnapshot(env);
-    console.log(`Daily snapshot saved: ${result.date} net_worth=${Math.round(result.net_worth_krw)}`);
+    await takeSnapshot(env);
   },
 } satisfies ExportedHandler<Env>;

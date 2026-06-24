@@ -40,3 +40,22 @@ CREATE TABLE IF NOT EXISTS fx_cache (
   rate REAL NOT NULL,
   updated_at TEXT NOT NULL DEFAULT (datetime('now'))
 );
+
+-- 유튜브 콘텐츠 검증 결과 저장 테이블
+CREATE TABLE IF NOT EXISTS content_checks (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  input_text TEXT NOT NULL,
+  channel_name TEXT,
+  channel_grade TEXT,
+  channel_stars INTEGER DEFAULT 0,
+  content_type TEXT,
+  checklist_pass INTEGER DEFAULT 0,
+  checklist_total INTEGER DEFAULT 5,
+  summary TEXT,
+  portfolio_points TEXT,
+  verdict TEXT,
+  verdict_reason TEXT,
+  raw_result TEXT,
+  applied_to_portfolio INTEGER DEFAULT 0,
+  created_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
